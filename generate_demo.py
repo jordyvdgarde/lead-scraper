@@ -67,6 +67,7 @@ def generate_demo_data():
         bron = random.choice(BRONNEN)
         link = f"{bron}{random.randint(100000, 999999)}"
 
+        source_names = ["Indeed", "Jooble", "NVB", "Werkzoeken", "Randstad"]
         leads.append({
             "bedrijf": company,
             "functietitel": titel,
@@ -74,6 +75,7 @@ def generate_demo_data():
             "provincie": get_province_for_location(city),
             "link": link,
             "datum_geplaatst": date_posted,
+            "bron": random.choice(source_names),
             "telefoon": phone,
             "email": email,
             "website": website,

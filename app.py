@@ -7,6 +7,7 @@ import streamlit as st
 import pandas as pd
 
 from config import PROVINCES, CSV_PATH, SEARCH_QUERY
+from scraper import ALL_SOURCES
 from storage import load_leads
 
 
@@ -74,8 +75,8 @@ scrape_provincie = st.sidebar.selectbox(
 )
 bronnen = st.sidebar.multiselect(
     "Bronnen",
-    ["indeed", "jooble", "nvb"],
-    default=["indeed", "jooble", "nvb"],
+    ALL_SOURCES,
+    default=ALL_SOURCES,
 )
 do_enrich = st.sidebar.checkbox("Verrijk met contactinfo", value=False)
 

@@ -1,10 +1,14 @@
-"""Job listing scraper for Dutch job sites."""
+"""Job listing scraper for Dutch job sites.
+
+Default sources: Nationale Vacaturebank, Werkzoeken.nl, Randstad.nl
+Optional sources: Indeed.nl, Jooble.org (prone to blocking/CAPTCHA)
+"""
 
 import logging
 import time
 import re
-from datetime import datetime
-from urllib.parse import urljoin, quote_plus
+from datetime import datetime, timedelta
+from urllib.parse import urljoin, quote_plus, urlparse
 from urllib.robotparser import RobotFileParser
 
 import requests
@@ -21,14 +25,19 @@ from config import (
 
 logger = logging.getLogger(__name__)
 
-# Cache for robots.txt parsers
 _robots_cache: dict[str, RobotFileParser] = {}
+
+
+# ---------------------------------------------------------------------------
+# Network helpers
+# ---------------------------------------------------------------------------
+def _is_proxy_error(error: Exception) -> bool:
+    err_str = str(error).lower()
+    return any(kw in err_str for kw in ["proxy", "tunnel", "403 forbidden", "407"])
 
 
 def check_robots_txt(url: str, user_agent: str = "*") -> bool:
     """Check if a URL is allowed by the site's robots.txt."""
-    from urllib.parse import urlparse
-
     parsed = urlparse(url)
     base = f"{parsed.scheme}://{parsed.netloc}"
 
@@ -38,7 +47,7 @@ def check_robots_txt(url: str, user_agent: str = "*") -> bool:
         try:
             rp.read()
         except Exception:
-            logger.debug("Kon robots.txt niet laden voor %s, ga door", base)
+            logger.debug("Kon robots.txt niet laden voor %s, sta toe", base)
             return True
         _robots_cache[base] = rp
 
@@ -46,14 +55,14 @@ def check_robots_txt(url: str, user_agent: str = "*") -> bool:
 
 
 def create_session() -> requests.Session:
-    """Create a requests session with proper headers."""
+    """Create a requests session with realistic browser headers."""
     session = requests.Session()
     session.headers.update(HEADERS)
     return session
 
 
 def get_page(url: str, session: requests.Session) -> BeautifulSoup | None:
-    """Fetch a page with retry logic and robots.txt compliance."""
+    """Fetch a page with retry logic, robots.txt compliance, proxy detection."""
     if not check_robots_txt(url):
         logger.warning("Geblokkeerd door robots.txt: %s", url)
         return None
@@ -76,41 +85,76 @@ def get_page(url: str, session: requests.Session) -> BeautifulSoup | None:
             response.raise_for_status()
             return BeautifulSoup(response.text, "lxml")
 
+        except (requests.exceptions.ProxyError, requests.exceptions.ConnectionError) as e:
+            if isinstance(e, requests.exceptions.ProxyError) or _is_proxy_error(e):
+                logger.error(
+                    "Proxy/firewall blokkeert %s — schakel proxy uit of "
+                    "gebruik een ander netwerk.", urlparse(url).netloc,
+                )
+                return None
+            if attempt < MAX_RETRIES - 1:
+                wait = RETRY_BACKOFF ** (attempt + 1)
+                logger.warning("Verbindingsfout %s, retry in %ds", urlparse(url).netloc, wait)
+                time.sleep(wait)
+            else:
+                logger.error("Kan %s niet bereiken na %d pogingen", urlparse(url).netloc, MAX_RETRIES)
+
         except requests.exceptions.RequestException as e:
             if attempt < MAX_RETRIES - 1:
                 wait = RETRY_BACKOFF ** (attempt + 1)
-                logger.warning("Fout bij ophalen %s: %s, retry in %ds", url, e, wait)
+                logger.warning("Fout bij %s: %s, retry in %ds", urlparse(url).netloc, e, wait)
                 time.sleep(wait)
             else:
                 logger.error("Kan %s niet ophalen na %d pogingen: %s", url, MAX_RETRIES, e)
+
     return None
 
 
+# ---------------------------------------------------------------------------
+# Date parsing
+# ---------------------------------------------------------------------------
+_DUTCH_MONTHS = {
+    "januari": "01", "februari": "02", "maart": "03", "april": "04",
+    "mei": "05", "juni": "06", "juli": "07", "augustus": "08",
+    "september": "09", "oktober": "10", "november": "11", "december": "12",
+    "jan": "01", "feb": "02", "mrt": "03", "apr": "04",
+    "jun": "06", "jul": "07", "aug": "08", "sep": "09",
+    "okt": "10", "nov": "11", "dec": "12",
+}
+
+
 def _parse_dutch_date(date_str: str) -> str:
-    """Try to parse a Dutch date string into YYYY-MM-DD format."""
+    """Parse Dutch date string into YYYY-MM-DD format."""
     if not date_str:
         return ""
 
     date_str = date_str.strip().lower()
+    today = datetime.now()
 
-    # "vandaag" / "today"
-    if "vandaag" in date_str or "today" in date_str:
-        return datetime.now().strftime("%Y-%m-%d")
+    if any(w in date_str for w in ("vandaag", "today", "zojuist", "net geplaatst")):
+        return today.strftime("%Y-%m-%d")
 
-    # "gisteren" / "yesterday"
     if "gisteren" in date_str or "yesterday" in date_str:
-        from datetime import timedelta
-        return (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        return (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
-    # "X dagen geleden" / "X days ago"
     days_match = re.search(r"(\d+)\s*dag", date_str)
     if days_match:
-        from datetime import timedelta
-        days = int(days_match.group(1))
-        return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        return (today - timedelta(days=int(days_match.group(1)))).strftime("%Y-%m-%d")
 
-    # Try direct date parsing
-    for fmt in ("%d-%m-%Y", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y"):
+    hours_match = re.search(r"(\d+)\s*uur", date_str)
+    if hours_match:
+        return today.strftime("%Y-%m-%d")
+
+    for month_name, month_num in _DUTCH_MONTHS.items():
+        if month_name in date_str:
+            day_match = re.search(r"(\d{1,2})", date_str)
+            year_match = re.search(r"(\d{4})", date_str)
+            if day_match:
+                day = day_match.group(1).zfill(2)
+                year = year_match.group(1) if year_match else str(today.year)
+                return f"{year}-{month_num}-{day}"
+
+    for fmt in ("%d-%m-%Y", "%d %b %Y", "%Y-%m-%d", "%d/%m/%Y", "%d-%m-%y"):
         try:
             return datetime.strptime(date_str, fmt).strftime("%Y-%m-%d")
         except ValueError:
@@ -119,256 +163,313 @@ def _parse_dutch_date(date_str: str) -> str:
     return date_str
 
 
-def scrape_indeed(query: str, session: requests.Session, max_pages: int = 5):
-    """Scrape job listings from Indeed.nl."""
+def _make_lead(company, title, location, link, date_posted, source):
+    """Create a standardized lead dict."""
+    return {
+        "bedrijf": company,
+        "functietitel": title,
+        "locatie": location,
+        "provincie": get_province_for_location(location),
+        "link": link,
+        "datum_geplaatst": date_posted,
+        "bron": source,
+        "telefoon": None,
+        "email": None,
+        "website": None,
+        "datum_gescraped": datetime.now().strftime("%Y-%m-%d %H:%M"),
+    }
+
+
+# ===================================================================
+# SOURCE: Nationale Vacaturebank (nationalevacaturebank.nl)
+# ===================================================================
+def scrape_nationalevacaturebank(query, session, max_pages=5):
+    """Scrape Nationale Vacaturebank search results."""
+    base_url = "https://www.nationalevacaturebank.nl"
+    logger.info("Scraping Nationale Vacaturebank voor '%s'...", query)
+
+    for page in range(1, max_pages + 1):
+        url = f"{base_url}/vacature/zoeken?query={quote_plus(query)}&page={page}"
+        soup = get_page(url, session)
+        if not soup:
+            break
+
+        # NVB renders job cards as list items or divs with vacancy data
+        cards = soup.select('[class*="vacancy-item"], [class*="vacancy-card"], [class*="job-item"], article')
+        if not cards:
+            cards = soup.find_all("li", attrs={"data-url": True})
+        if not cards:
+            logger.info("NVB pagina %d: geen resultaten", page)
+            break
+
+        logger.info("NVB pagina %d: %d items gevonden", page, len(cards))
+
+        for card in cards:
+            try:
+                # Title + link
+                a = card.find("a", href=True)
+                heading = card.find(["h2", "h3", "h4"])
+                if heading and heading.find("a"):
+                    a = heading.find("a")
+                if not a:
+                    continue
+
+                title = (heading or a).get_text(strip=True)
+                if len(title) < 4:
+                    continue
+                link = a["href"]
+                if link.startswith("/"):
+                    link = urljoin(base_url, link)
+
+                # Company
+                co = card.find(class_=re.compile(r"company|employer|organis", re.I))
+                company = co.get_text(strip=True) if co else ""
+
+                # Location
+                loc = card.find(class_=re.compile(r"location|city|plaats", re.I))
+                location = loc.get_text(strip=True) if loc else ""
+
+                # Date
+                dt = card.find(class_=re.compile(r"date|time|posted", re.I)) or card.find("time")
+                raw = (dt.get("datetime", "") or dt.get_text(strip=True)) if dt else ""
+
+                yield _make_lead(company, title, location, link, _parse_dutch_date(raw), "NVB")
+            except Exception as e:
+                logger.debug("NVB parse error: %s", e)
+
+
+# ===================================================================
+# SOURCE: Werkzoeken.nl
+# ===================================================================
+def scrape_werkzoeken(query, session, max_pages=5):
+    """Scrape werkzoeken.nl search results."""
+    base_url = "https://www.werkzoeken.nl"
+    logger.info("Scraping Werkzoeken.nl voor '%s'...", query)
+
+    for page in range(1, max_pages + 1):
+        url = f"{base_url}/vacatures?zoekterm={quote_plus(query)}&pagina={page}"
+        soup = get_page(url, session)
+        if not soup:
+            break
+
+        cards = soup.select('article, [class*="vacancy-"], [class*="job-"], [class*="result-item"]')
+        if not cards:
+            cards = soup.find_all("div", class_=re.compile(r"card|item", re.I))
+        if not cards:
+            logger.info("Werkzoeken pagina %d: geen resultaten", page)
+            break
+
+        logger.info("Werkzoeken pagina %d: %d items gevonden", page, len(cards))
+
+        for card in cards:
+            try:
+                heading = card.find(["h2", "h3", "h4"])
+                a = (heading.find("a") if heading else None) or card.find("a", href=True)
+                if not a:
+                    continue
+
+                title = (heading or a).get_text(strip=True)
+                if len(title) < 4:
+                    continue
+                link = a["href"]
+                if link.startswith("/"):
+                    link = urljoin(base_url, link)
+
+                co = card.find(class_=re.compile(r"company|employer|bedrijf", re.I))
+                company = co.get_text(strip=True) if co else ""
+
+                loc = card.find(class_=re.compile(r"location|city|plaats|locatie", re.I))
+                location = loc.get_text(strip=True) if loc else ""
+
+                dt = card.find(class_=re.compile(r"date|datum|time", re.I)) or card.find("time")
+                raw = (dt.get("datetime", "") or dt.get_text(strip=True)) if dt else ""
+
+                yield _make_lead(company, title, location, link, _parse_dutch_date(raw), "Werkzoeken")
+            except Exception as e:
+                logger.debug("Werkzoeken parse error: %s", e)
+
+
+# ===================================================================
+# SOURCE: Randstad.nl
+# ===================================================================
+def scrape_randstad(query, session, max_pages=5):
+    """Scrape Randstad.nl search results."""
+    base_url = "https://www.randstad.nl"
+    logger.info("Scraping Randstad.nl voor '%s'...", query)
+
+    for page in range(1, max_pages + 1):
+        url = f"{base_url}/werkzoekende/vacatures/?searchquery={quote_plus(query)}&page={page}"
+        soup = get_page(url, session)
+        if not soup:
+            break
+
+        cards = soup.select(
+            'article[class*="job"], article[class*="card"], '
+            '[class*="job-card"], [class*="job-item"], '
+            'li[class*="job"], li[class*="vacancy"]'
+        )
+        if not cards:
+            cards = soup.find_all("article")
+        if not cards:
+            logger.info("Randstad pagina %d: geen resultaten", page)
+            break
+
+        logger.info("Randstad pagina %d: %d items gevonden", page, len(cards))
+
+        for card in cards:
+            try:
+                heading = card.find(["h2", "h3", "h4"])
+                a = (heading.find("a") if heading else None) or card.find("a", href=True)
+                if not a:
+                    continue
+
+                title = (heading or a).get_text(strip=True)
+                if len(title) < 4:
+                    continue
+                link = a["href"]
+                if link.startswith("/"):
+                    link = urljoin(base_url, link)
+
+                co = card.find(class_=re.compile(r"company|employer|client", re.I))
+                company = co.get_text(strip=True) if co else ""
+
+                loc = card.find(class_=re.compile(r"location|city|place|plaats", re.I))
+                location = loc.get_text(strip=True) if loc else ""
+
+                dt = card.find(class_=re.compile(r"date|posted|time", re.I)) or card.find("time")
+                raw = (dt.get("datetime", "") or dt.get_text(strip=True)) if dt else ""
+
+                yield _make_lead(company, title, location, link, _parse_dutch_date(raw), "Randstad")
+            except Exception as e:
+                logger.debug("Randstad parse error: %s", e)
+
+
+# ===================================================================
+# SOURCE: Indeed.nl (optional — aggressive anti-scraping)
+# ===================================================================
+def scrape_indeed(query, session, max_pages=5):
+    """Scrape Indeed.nl. Often blocked by CAPTCHA/Cloudflare."""
     base_url = "https://nl.indeed.com"
-    logger.info("Start scraping Indeed.nl voor '%s'...", query)
+    logger.info("Scraping Indeed.nl voor '%s'...", query)
 
     for page in range(max_pages):
-        start = page * 10
-        search_url = (
-            f"{base_url}/jobs?q={quote_plus(query)}"
-            f"&l=Nederland&start={start}"
-        )
-
-        soup = get_page(search_url, session)
+        url = f"{base_url}/jobs?q={quote_plus(query)}&l=Nederland&start={page * 10}"
+        soup = get_page(url, session)
         if not soup:
-            logger.warning("Indeed pagina %d kon niet geladen worden", page + 1)
             break
 
-        # Indeed uses various class patterns for job cards
-        job_cards = soup.find_all("div", class_=re.compile(r"job_seen_beacon|cardOutline|result"))
-        if not job_cards:
-            # Try alternative selectors
-            job_cards = soup.find_all("a", class_=re.compile(r"tapItem|jcs-JobTitle"))
-
-        if not job_cards:
-            logger.info("Geen resultaten meer op Indeed pagina %d", page + 1)
+        cards = soup.find_all("div", class_=re.compile(r"job_seen_beacon|cardOutline|tapItem"))
+        if not cards:
+            cards = soup.find_all("li", class_=re.compile(r"result|job"))
+        if not cards:
+            text = soup.get_text().lower()
+            if "captcha" in text or "blocked" in text or "verify" in text:
+                logger.warning("Indeed CAPTCHA/block gedetecteerd, stop")
+            else:
+                logger.info("Indeed pagina %d: geen resultaten", page + 1)
             break
 
-        logger.info("Indeed pagina %d: %d vacatures gevonden", page + 1, len(job_cards))
+        logger.info("Indeed pagina %d: %d items gevonden", page + 1, len(cards))
 
-        for card in job_cards:
+        for card in cards:
             try:
-                # Title and link
-                title_elem = card.find("h2") or card.find("a", class_=re.compile(r"Title|title"))
-                if not title_elem:
+                h2 = card.find("h2")
+                a = (h2.find("a") if h2 else None) or card.find("a", href=True)
+                if not a:
                     continue
 
-                link_elem = title_elem.find("a") if title_elem.name != "a" else title_elem
-                if not link_elem or not link_elem.get("href"):
-                    link_elem = card.find("a", href=True)
-
-                if not link_elem:
-                    continue
-
-                title = title_elem.get_text(strip=True)
-                link = link_elem["href"]
+                title = (h2 or a).get_text(strip=True)
+                link = a["href"]
                 if link.startswith("/"):
                     link = urljoin(base_url, link)
 
-                # Company
-                company_elem = (
+                co = (
                     card.find("span", {"data-testid": "company-name"})
-                    or card.find("span", class_=re.compile(r"company"))
-                    or card.find("a", class_=re.compile(r"company"))
+                    or card.find(class_=re.compile(r"company", re.I))
                 )
-                company = company_elem.get_text(strip=True) if company_elem else ""
+                company = co.get_text(strip=True) if co else ""
 
-                # Location
-                location_elem = (
+                loc = (
                     card.find("div", {"data-testid": "text-location"})
-                    or card.find("div", class_=re.compile(r"location"))
-                    or card.find("span", class_=re.compile(r"location"))
+                    or card.find(class_=re.compile(r"location", re.I))
                 )
-                location = location_elem.get_text(strip=True) if location_elem else ""
+                location = loc.get_text(strip=True) if loc else ""
 
-                # Date
-                date_elem = (
-                    card.find("span", class_=re.compile(r"date"))
-                    or card.find("span", {"data-testid": re.compile(r"date")})
-                )
-                date_posted = _parse_dutch_date(
-                    date_elem.get_text(strip=True) if date_elem else ""
-                )
+                dt = card.find(class_=re.compile(r"date", re.I))
+                raw = dt.get_text(strip=True) if dt else ""
 
-                yield {
-                    "bedrijf": company,
-                    "functietitel": title,
-                    "locatie": location,
-                    "provincie": get_province_for_location(location),
-                    "link": link,
-                    "datum_geplaatst": date_posted,
-                    "telefoon": None,
-                    "email": None,
-                    "website": None,
-                    "datum_gescraped": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
+                yield _make_lead(company, title, location, link, _parse_dutch_date(raw), "Indeed")
             except Exception as e:
-                logger.debug("Fout bij parsen Indeed vacature: %s", e)
-                continue
+                logger.debug("Indeed parse error: %s", e)
 
 
-def scrape_jooble(query: str, session: requests.Session, max_pages: int = 5):
-    """Scrape job listings from Jooble.org (Dutch version)."""
+# ===================================================================
+# SOURCE: Jooble.org/nl (optional)
+# ===================================================================
+def scrape_jooble(query, session, max_pages=5):
+    """Scrape Jooble.org NL. May block scrapers."""
     base_url = "https://nl.jooble.org"
-    logger.info("Start scraping Jooble.org voor '%s'...", query)
+    logger.info("Scraping Jooble.org voor '%s'...", query)
 
     for page in range(1, max_pages + 1):
-        search_url = f"{base_url}/SearchResult?ukw={quote_plus(query)}&lokw=Nederland&p={page}"
-
-        soup = get_page(search_url, session)
+        url = f"{base_url}/SearchResult?ukw={quote_plus(query)}&lokw=Nederland&p={page}"
+        soup = get_page(url, session)
         if not soup:
-            logger.warning("Jooble pagina %d kon niet geladen worden", page)
             break
 
-        # Jooble job cards
-        job_cards = soup.find_all("article") or soup.find_all(
+        cards = soup.find_all("article") or soup.find_all(
             "div", class_=re.compile(r"vacancy|job-item|_card", re.I)
         )
-
-        if not job_cards:
-            logger.info("Geen resultaten meer op Jooble pagina %d", page)
+        if not cards:
+            logger.info("Jooble pagina %d: geen resultaten", page)
             break
 
-        logger.info("Jooble pagina %d: %d vacatures gevonden", page, len(job_cards))
+        logger.info("Jooble pagina %d: %d items gevonden", page, len(cards))
 
-        for card in job_cards:
+        for card in cards:
             try:
-                # Title and link
-                title_elem = card.find("a", class_=re.compile(r"title|header|link", re.I))
-                if not title_elem:
-                    title_elem = card.find("h2") or card.find("h3")
-                    if title_elem:
-                        link_tag = title_elem.find("a")
-                        if link_tag:
-                            title_elem = link_tag
-
-                if not title_elem:
+                a = card.find("a", class_=re.compile(r"title|header|link", re.I))
+                if not a:
+                    heading = card.find(["h2", "h3"])
+                    a = (heading.find("a") if heading else None) or card.find("a", href=True)
+                if not a:
                     continue
 
-                title = title_elem.get_text(strip=True)
-                link = title_elem.get("href", "")
+                title = a.get_text(strip=True)
+                link = a.get("href", "")
                 if link.startswith("/"):
                     link = urljoin(base_url, link)
                 if not link:
                     continue
 
-                # Company
-                company_elem = card.find(
-                    "span", class_=re.compile(r"company|employer", re.I)
-                ) or card.find("p", class_=re.compile(r"company|employer", re.I))
-                company = company_elem.get_text(strip=True) if company_elem else ""
+                co = card.find(class_=re.compile(r"company|employer", re.I))
+                company = co.get_text(strip=True) if co else ""
 
-                # Location
-                location_elem = card.find(
-                    "span", class_=re.compile(r"location|city|place", re.I)
-                ) or card.find("div", class_=re.compile(r"location|city", re.I))
-                location = location_elem.get_text(strip=True) if location_elem else ""
+                loc = card.find(class_=re.compile(r"location|city|place", re.I))
+                location = loc.get_text(strip=True) if loc else ""
 
-                # Date
-                date_elem = card.find(
-                    "span", class_=re.compile(r"date|time|posted", re.I)
-                ) or card.find("time")
-                raw_date = ""
-                if date_elem:
-                    raw_date = date_elem.get("datetime", "") or date_elem.get_text(strip=True)
-                date_posted = _parse_dutch_date(raw_date)
+                dt = card.find(class_=re.compile(r"date|time|posted", re.I)) or card.find("time")
+                raw = (dt.get("datetime", "") or dt.get_text(strip=True)) if dt else ""
 
-                yield {
-                    "bedrijf": company,
-                    "functietitel": title,
-                    "locatie": location,
-                    "provincie": get_province_for_location(location),
-                    "link": link,
-                    "datum_geplaatst": date_posted,
-                    "telefoon": None,
-                    "email": None,
-                    "website": None,
-                    "datum_gescraped": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
+                yield _make_lead(company, title, location, link, _parse_dutch_date(raw), "Jooble")
             except Exception as e:
-                logger.debug("Fout bij parsen Jooble vacature: %s", e)
-                continue
+                logger.debug("Jooble parse error: %s", e)
 
 
-def scrape_nationalevacaturebank(
-    query: str, session: requests.Session, max_pages: int = 5
-):
-    """Scrape job listings from Nationale Vacaturebank."""
-    base_url = "https://www.nationalevacaturebank.nl"
-    logger.info("Start scraping Nationale Vacaturebank voor '%s'...", query)
+# ===================================================================
+# Dispatcher
+# ===================================================================
+SOURCE_MAP = {
+    "nvb": scrape_nationalevacaturebank,
+    "werkzoeken": scrape_werkzoeken,
+    "randstad": scrape_randstad,
+    "indeed": scrape_indeed,
+    "jooble": scrape_jooble,
+}
 
-    for page in range(1, max_pages + 1):
-        search_url = (
-            f"{base_url}/vacature/zoeken"
-            f"?query={quote_plus(query)}&page={page}"
-        )
-
-        soup = get_page(search_url, session)
-        if not soup:
-            logger.warning("NVB pagina %d kon niet geladen worden", page)
-            break
-
-        job_cards = soup.find_all(
-            "div", class_=re.compile(r"vacancy|job|result-item", re.I)
-        ) or soup.find_all("article")
-
-        if not job_cards:
-            logger.info("Geen resultaten meer op NVB pagina %d", page)
-            break
-
-        logger.info("NVB pagina %d: %d vacatures gevonden", page, len(job_cards))
-
-        for card in job_cards:
-            try:
-                title_elem = card.find("a", class_=re.compile(r"title|link", re.I))
-                if not title_elem:
-                    heading = card.find("h2") or card.find("h3")
-                    if heading:
-                        title_elem = heading.find("a") or heading
-
-                if not title_elem:
-                    continue
-
-                title = title_elem.get_text(strip=True)
-                link = title_elem.get("href", "")
-                if link.startswith("/"):
-                    link = urljoin(base_url, link)
-                if not link:
-                    continue
-
-                company_elem = card.find(
-                    class_=re.compile(r"company|employer|organization", re.I)
-                )
-                company = company_elem.get_text(strip=True) if company_elem else ""
-
-                location_elem = card.find(
-                    class_=re.compile(r"location|city|place", re.I)
-                )
-                location = location_elem.get_text(strip=True) if location_elem else ""
-
-                date_elem = card.find(class_=re.compile(r"date|time", re.I))
-                raw_date = ""
-                if date_elem:
-                    raw_date = date_elem.get("datetime", "") or date_elem.get_text(strip=True)
-                date_posted = _parse_dutch_date(raw_date)
-
-                yield {
-                    "bedrijf": company,
-                    "functietitel": title,
-                    "locatie": location,
-                    "provincie": get_province_for_location(location),
-                    "link": link,
-                    "datum_geplaatst": date_posted,
-                    "telefoon": None,
-                    "email": None,
-                    "website": None,
-                    "datum_gescraped": datetime.now().strftime("%Y-%m-%d %H:%M"),
-                }
-            except Exception as e:
-                logger.debug("Fout bij parsen NVB vacature: %s", e)
-                continue
+# Default sources — the ones that reliably allow scraping
+DEFAULT_SOURCES = ["nvb", "werkzoeken", "randstad"]
+ALL_SOURCES = list(SOURCE_MAP.keys())
 
 
 def scrape_all(
@@ -377,48 +478,47 @@ def scrape_all(
     max_pages: int = 5,
     sources: list[str] | None = None,
 ) -> list[dict]:
-    """
-    Scrape all configured sources and return combined results.
-
-    Args:
-        query: Search query (defaults to SEARCH_QUERY from config)
-        province: Optional province filter
-        max_pages: Maximum pages per source
-        sources: List of sources to use ('indeed', 'jooble', 'nvb')
-    """
+    """Scrape all configured sources and return combined, deduplicated results."""
     query = query or SEARCH_QUERY
-    sources = sources or ["indeed", "jooble", "nvb"]
+    sources = sources or DEFAULT_SOURCES
     session = create_session()
     all_leads = []
-    seen_links = set()
-
-    source_map = {
-        "indeed": scrape_indeed,
-        "jooble": scrape_jooble,
-        "nvb": scrape_nationalevacaturebank,
-    }
+    seen_links: set[str] = set()
+    failed_sources = []
 
     for source_name in sources:
-        scraper_fn = source_map.get(source_name)
-        if not scraper_fn:
-            logger.warning("Onbekende bron: %s", source_name)
+        fn = SOURCE_MAP.get(source_name)
+        if not fn:
+            logger.warning("Onbekende bron: %s (kies uit: %s)", source_name, ", ".join(ALL_SOURCES))
             continue
 
         try:
-            for lead in scraper_fn(query, session, max_pages):
-                # Deduplicate by link
+            count = 0
+            for lead in fn(query, session, max_pages):
                 if lead["link"] in seen_links:
                     continue
                 seen_links.add(lead["link"])
-
-                # Province filter
                 if province and lead.get("provincie") != province:
                     continue
-
                 all_leads.append(lead)
+                count += 1
+
+            if count > 0:
+                logger.info("%s: %d vacatures opgeleverd", source_name, count)
+            else:
+                failed_sources.append(source_name)
+
         except Exception as e:
-            logger.error("Fout bij scrapen van %s: %s", source_name, e)
-            continue
+            logger.error("Fout bij %s: %s", source_name, e)
+            failed_sources.append(source_name)
+
+    if failed_sources and not all_leads:
+        logger.warning(
+            "Geen resultaten. Mislukte bronnen: %s. "
+            "Oorzaken: proxy/firewall, CAPTCHA, of gewijzigde site-structuur. "
+            "Draai het script op een netwerk zonder proxy.",
+            ", ".join(failed_sources),
+        )
 
     logger.info("Totaal: %d unieke vacatures gevonden", len(all_leads))
     return all_leads

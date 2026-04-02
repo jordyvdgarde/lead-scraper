@@ -7,7 +7,7 @@ import sys
 import pandas as pd
 
 from config import SEARCH_QUERY, PROVINCES, CSV_PATH
-from scraper import scrape_all, ALL_SOURCES
+from scraper import scrape_all, ALL_SOURCES, DEFAULT_SOURCES
 from enricher import enrich_leads
 from storage import load_leads, save_leads, merge_leads
 
@@ -66,8 +66,8 @@ Voorbeelden:
         "--bronnen",
         nargs="+",
         choices=ALL_SOURCES,
-        default=ALL_SOURCES,
-        help=f"Welke bronnen te gebruiken (standaard: {', '.join(ALL_SOURCES)})",
+        default=DEFAULT_SOURCES,
+        help=f"Welke bronnen (standaard: {', '.join(DEFAULT_SOURCES)}; ook beschikbaar: indeed, jooble)",
     )
     parser.add_argument(
         "--verbose", "-v",

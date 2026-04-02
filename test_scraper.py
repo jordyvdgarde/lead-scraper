@@ -12,12 +12,13 @@ from bs4 import BeautifulSoup
 
 from scraper import (
     _parse_dutch_date,
+    _parse_serpapi_date,
     _make_lead,
+    scrape_serpapi,
+    scrape_serpapi_search,
     scrape_nationalevacaturebank,
     scrape_werkzoeken,
     scrape_randstad,
-    scrape_indeed,
-    scrape_jooble,
     scrape_all,
 )
 
@@ -102,53 +103,57 @@ RANDSTAD_HTML = """
 </body></html>
 """
 
-INDEED_HTML = """
-<html><body>
-<div id="mosaic-provider-jobcards">
-  <div class="job_seen_beacon">
-    <h2 class="jobTitle">
-      <a href="/viewjob?jk=abc123" class="jcs-JobTitle">
-        Commercieel Medewerker Binnendienst
-      </a>
-    </h2>
-    <span data-testid="company-name">Fugro</span>
-    <div data-testid="text-location">Leidschendam</div>
-    <span class="date">3 dagen geleden</span>
-  </div>
-  <div class="job_seen_beacon">
-    <h2 class="jobTitle">
-      <a href="/viewjob?jk=def456">
-        Senior Inside Sales
-      </a>
-    </h2>
-    <span data-testid="company-name">KPN</span>
-    <div data-testid="text-location">Den Haag</div>
-    <span class="date">vandaag</span>
-  </div>
-</div>
-</body></html>
-"""
 
-JOOBLE_HTML = """
-<html><body>
-<div class="results">
-  <article>
-    <a class="title-link" href="/desc/commercieel-medewerker-99001">
-      Commercieel Binnendienst Medewerker
-    </a>
-    <span class="company-name">SHV Holdings</span>
-    <span class="location">Den Haag</span>
-    <span class="date">4 dagen geleden</span>
-  </article>
-  <article>
-    <h2><a href="/desc/sales-support-99002">Sales Support</a></h2>
-    <span class="employer">Post NL</span>
-    <span class="city">Den Haag</span>
-    <time datetime="2026-03-25">25 maart 2026</time>
-  </article>
-</div>
-</body></html>
-"""
+# Sample SerpAPI Google Jobs JSON response
+SERPAPI_JOBS_RESPONSE = {
+    "jobs_results": [
+        {
+            "title": "Commercieel Medewerker Binnendienst",
+            "company_name": "Vopak",
+            "location": "Rotterdam, Zuid-Holland",
+            "detected_extensions": {"posted_at": "3 days ago"},
+            "apply_options": [{"link": "https://www.vopak.com/careers/job-12345"}],
+        },
+        {
+            "title": "Inside Sales Medewerker",
+            "company_name": "Eneco",
+            "location": "Den Haag, Zuid-Holland",
+            "detected_extensions": {"posted_at": "1 day ago"},
+            "apply_options": [{"link": "https://www.eneco.nl/vacature/67890"}],
+        },
+        {
+            "title": "Sales Support",
+            "company_name": "Coolblue",
+            "location": "Rotterdam, Zuid-Holland",
+            "detected_extensions": {"posted_at": "Just posted"},
+            "apply_options": [{"link": "https://www.coolblue.nl/jobs/11111"}],
+        },
+    ],
+}
+
+SERPAPI_JOBS_EMPTY = {"jobs_results": []}
+
+SERPAPI_SEARCH_RESPONSE = {
+    "organic_results": [
+        {
+            "title": "Commercieel Medewerker - Fugro",
+            "link": "https://www.indeed.nl/viewjob?jk=abc123",
+            "snippet": "Fugro zoekt een commercieel medewerker binnendienst in Leidschendam.",
+            "date": "2 days ago",
+        },
+        {
+            "title": "Sales Medewerker Binnendienst | Kramp Groep",
+            "link": "https://www.nationalevacaturebank.nl/vacature/99999",
+            "snippet": "Werken bij Kramp Groep in Gouda als sales medewerker.",
+            "date": "5 days ago",
+        },
+        {
+            "title": "Some random blog post",
+            "link": "https://www.example.com/blog/post",
+            "snippet": "Not a job site at all",
+        },
+    ],
+}
 
 
 class TestDateParsing(unittest.TestCase):
@@ -276,49 +281,94 @@ class TestRandstadParser(unittest.TestCase):
         self.assertEqual(results[1]["datum_geplaatst"], five_days)
 
 
-class TestIndeedParser(unittest.TestCase):
-    """Test Indeed.nl parsing."""
+class TestSerpAPIDateParsing(unittest.TestCase):
+    """Test SerpAPI date string parsing."""
 
-    @patch("scraper.get_page")
-    def test_parse_indeed_results(self, mock_gp):
-        mock_gp.side_effect = [
-            BeautifulSoup(INDEED_HTML, "lxml"),
-            None,
-        ]
+    def test_just_posted(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.assertEqual(_parse_serpapi_date("Just posted"), today)
+
+    def test_days_ago(self):
+        expected = (datetime.now() - timedelta(days=3)).strftime("%Y-%m-%d")
+        self.assertEqual(_parse_serpapi_date("3 days ago"), expected)
+
+    def test_hours_ago(self):
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.assertEqual(_parse_serpapi_date("5 hours ago"), today)
+
+    def test_empty(self):
+        self.assertEqual(_parse_serpapi_date(""), "")
+
+
+class TestSerpAPIParser(unittest.TestCase):
+    """Test SerpAPI Google Jobs parsing."""
+
+    @patch("scraper._get_serpapi_key", return_value="test_key")
+    def test_parse_serpapi_jobs(self, _mock_key):
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = SERPAPI_JOBS_RESPONSE
+        mock_session.get.return_value = mock_resp
+
+        results = list(scrape_serpapi("test", mock_session, max_pages=1))
+
+        self.assertEqual(len(results), 3)
+
+        self.assertEqual(results[0]["bedrijf"], "Vopak")
+        self.assertEqual(results[0]["functietitel"], "Commercieel Medewerker Binnendienst")
+        self.assertIn("Rotterdam", results[0]["locatie"])
+        self.assertEqual(results[0]["link"], "https://www.vopak.com/careers/job-12345")
+        self.assertEqual(results[0]["bron"], "Google Jobs")
+
+        self.assertEqual(results[1]["bedrijf"], "Eneco")
+        self.assertEqual(results[2]["bedrijf"], "Coolblue")
+
+        today = datetime.now().strftime("%Y-%m-%d")
+        self.assertEqual(results[2]["datum_geplaatst"], today)
+
+    @patch("scraper._get_serpapi_key", return_value=None)
+    def test_no_api_key(self, _mock_key):
         session = MagicMock()
-        results = list(scrape_indeed("test", session, max_pages=2))
+        results = list(scrape_serpapi("test", session))
+        self.assertEqual(len(results), 0)
 
+    @patch("scraper._get_serpapi_key", return_value="test_key")
+    def test_empty_results(self, _mock_key):
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = SERPAPI_JOBS_EMPTY
+        mock_session.get.return_value = mock_resp
+
+        results = list(scrape_serpapi("test", mock_session, max_pages=1))
+        self.assertEqual(len(results), 0)
+
+
+class TestSerpAPISearchParser(unittest.TestCase):
+    """Test SerpAPI Google Search organic results parsing."""
+
+    @patch("scraper._get_serpapi_key", return_value="test_key")
+    def test_parse_search_results(self, _mock_key):
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = SERPAPI_SEARCH_RESPONSE
+        mock_session.get.return_value = mock_resp
+
+        results = list(scrape_serpapi_search("test", mock_session, max_pages=1))
+
+        # Should skip the non-job-site result (example.com)
         self.assertEqual(len(results), 2)
 
+        # First result: "Commercieel Medewerker - Fugro"
         self.assertEqual(results[0]["bedrijf"], "Fugro")
-        self.assertEqual(results[0]["locatie"], "Leidschendam")
-        self.assertEqual(results[0]["provincie"], "Zuid-Holland")
-        self.assertEqual(results[0]["bron"], "Indeed")
+        self.assertEqual(results[0]["functietitel"], "Commercieel Medewerker")
+        self.assertIn("indeed", results[0]["link"])
 
-        self.assertEqual(results[1]["bedrijf"], "KPN")
-        self.assertEqual(results[1]["datum_geplaatst"], datetime.now().strftime("%Y-%m-%d"))
-
-
-class TestJoobleParser(unittest.TestCase):
-    """Test Jooble.org parsing."""
-
-    @patch("scraper.get_page")
-    def test_parse_jooble_results(self, mock_gp):
-        mock_gp.side_effect = [
-            BeautifulSoup(JOOBLE_HTML, "lxml"),
-            None,
-        ]
-        session = MagicMock()
-        results = list(scrape_jooble("test", session, max_pages=2))
-
-        self.assertEqual(len(results), 2)
-
-        self.assertEqual(results[0]["bedrijf"], "SHV Holdings")
-        self.assertEqual(results[0]["locatie"], "Den Haag")
-        self.assertEqual(results[0]["bron"], "Jooble")
-
-        self.assertEqual(results[1]["bedrijf"], "Post NL")
-        self.assertEqual(results[1]["datum_geplaatst"], "2026-03-25")
+        # Second result: "Sales Medewerker Binnendienst | Kramp Groep"
+        self.assertEqual(results[1]["bedrijf"], "Kramp Groep")
+        self.assertIn("nationalevacaturebank", results[1]["link"])
 
 
 class TestScrapeAll(unittest.TestCase):
@@ -360,9 +410,34 @@ class TestScrapeAll(unittest.TestCase):
         session_mock = MagicMock()
 
         with patch("scraper.create_session", return_value=session_mock):
-            results = scrape_all(query="test", max_pages=1)
+            results = scrape_all(
+                query="test", max_pages=1,
+                sources=["nvb", "werkzoeken", "randstad"],
+            )
 
         self.assertEqual(len(results), 3)  # not 6
+
+    @patch("scraper._get_serpapi_key", return_value="test_key")
+    def test_serpapi_with_province_filter(self, _mock_key):
+        """Test SerpAPI source with province filtering via scrape_all."""
+        mock_session = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.json.return_value = SERPAPI_JOBS_RESPONSE
+        mock_session.get.return_value = mock_resp
+
+        with patch("scraper.create_session", return_value=mock_session):
+            results = scrape_all(
+                query="test",
+                province="Zuid-Holland",
+                max_pages=1,
+                sources=["serpapi"],
+            )
+
+        # All 3 jobs have Rotterdam/Den Haag = Zuid-Holland
+        self.assertEqual(len(results), 3)
+        for r in results:
+            self.assertEqual(r["provincie"], "Zuid-Holland")
 
 
 class TestMakeLead(unittest.TestCase):

@@ -7,7 +7,7 @@ import sys
 import pandas as pd
 
 from config import SEARCH_QUERY, PROVINCES, CSV_PATH
-from scraper import scrape_all, ALL_SOURCES, DEFAULT_SOURCES
+from scraper import scrape_all, ALL_SOURCES, DEFAULT_SOURCES, _get_serpapi_key
 from enricher import enrich_leads
 from storage import load_leads, save_leads, merge_leads
 
@@ -28,11 +28,16 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Voorbeelden:
-  python main.py                           # Scrape alle provincies
-  python main.py --provincie Noord-Holland  # Alleen Noord-Holland
-  python main.py --enrich                   # Met contactinfo verrijking
-  python main.py --query "sales medewerker" # Andere zoekterm
-  python main.py --bronnen indeed jooble    # Alleen specifieke bronnen
+  python main.py                                  # Scrape via SerpAPI (of HTML fallback)
+  python main.py --provincie Zuid-Holland          # Alleen Zuid-Holland
+  python main.py --enrich                         # Met contactinfo verrijking
+  python main.py --query "sales medewerker"       # Andere zoekterm
+  python main.py --bronnen serpapi google          # SerpAPI + Google Search
+  python main.py --bronnen nvb werkzoeken randstad # Alleen HTML scrapers
+
+  Stel SERPAPI_KEY in voor de beste resultaten:
+    export SERPAPI_KEY=je_key_hier
+  Of maak een .env bestand met: SERPAPI_KEY=je_key_hier
         """,
     )
     parser.add_argument(
@@ -66,8 +71,8 @@ Voorbeelden:
         "--bronnen",
         nargs="+",
         choices=ALL_SOURCES,
-        default=DEFAULT_SOURCES,
-        help=f"Welke bronnen (standaard: {', '.join(DEFAULT_SOURCES)}; ook beschikbaar: indeed, jooble)",
+        default=None,
+        help=f"Welke bronnen (standaard: serpapi als key beschikbaar, anders nvb+werkzoeken+randstad)",
     )
     parser.add_argument(
         "--verbose", "-v",
@@ -79,6 +84,18 @@ Voorbeelden:
     setup_logging(args.verbose)
 
     logger = logging.getLogger(__name__)
+
+    # Auto-detect best sources if not specified
+    if args.bronnen is None:
+        if _get_serpapi_key():
+            args.bronnen = ["serpapi"]
+        else:
+            args.bronnen = ["nvb", "werkzoeken", "randstad"]
+            logger.info(
+                "Geen SERPAPI_KEY gevonden — gebruik HTML scrapers als fallback. "
+                "Voor betere resultaten: stel SERPAPI_KEY in (gratis op serpapi.com)"
+            )
+
     logger.info("=== Lead Scraper gestart ===")
     logger.info("Zoekterm: %s", args.query)
     if args.provincie:
